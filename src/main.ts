@@ -419,8 +419,9 @@ function playChannel(c: Channel): void {
   btnPause.textContent = "❚❚"; // после play() обычно идёт воспроизведение
   playerStatus.textContent = "—";
   btnRetry.hidden = true; // новый канал — сбрасываем retry-статус
-  if (!player.play(c)) {
-    showToast("Формат потока не поддерживается");
+  const refused = player.play(c);
+  if (refused) {
+    showToast(refused);
     return;
   }
   // уровни/дорожки приходят асинхронно после парсинга манифеста
@@ -1047,6 +1048,8 @@ const segSession = createSegmentSession({
   onState: (state) => {
     console.debug(`[iptv-hub] seg: state=${state}`);
     renderRecButton(state === "recording");
+    // Ловим и остановку самой сессией — по потолку размера или сбою хранилища.
+    if (state === "idle") restoreLevelAfterRecording();
   },
   onSave: (blob, result) => {
     console.debug(
@@ -1063,6 +1066,34 @@ const segSession = createSegmentSession({
 // Подписка переживает смену канала: Player вешает обработчик на каждый новый
 // hls-инстанс. init-сегменты копятся всегда — для fMP4 без них файл нечитаем.
 player.setFragmentListener((payload, isInit) => segSession.feed(payload, isInit));
+
+/**
+ * Уровень качества, в который надо вернуться после записи (-1 = Auto).
+ * null — ничего не фиксировали.
+ */
+let levelBeforeRecording: number | null = null;
+
+/**
+ * Зафиксировать текущее качество на время записи. В режиме Auto плеер
+ * переключает уровень по обстановке, и в склейке сегментов оказались бы куски
+ * разного разрешения — многие плееры показывают такое криво.
+ */
+function pinLevelForRecording(): void {
+  const hls = player.getHls();
+  if (!hls || !hls.autoLevelEnabled) return;
+  const level = hls.currentLevel;
+  if (level < 0) return;
+  levelBeforeRecording = -1; // вернём обратно в Auto
+  player.setLevel(level);
+  console.debug(`[iptv-hub] seg: качество зафиксировано на уровне ${level}`);
+}
+
+function restoreLevelAfterRecording(): void {
+  if (levelBeforeRecording === null) return;
+  player.setLevel(levelBeforeRecording);
+  levelBeforeRecording = null;
+  console.debug("[iptv-hub] seg: качество возвращено в Auto");
+}
 
 /** Идёт ли запись любым из способов. */
 function isRecordingNow(): boolean {
@@ -1082,7 +1113,11 @@ function startRecording(): void {
   // HLS пишем сегментами; перекодирование остаётся для остального
   // (нативное воспроизведение, прямые mp4).
   if (player.getHls()) {
-    void segSession.start();
+    pinLevelForRecording();
+    void segSession.start().then(() => {
+      // старт мог не состояться (не создалось хранилище) — не держим качество
+      if (!segSession.isRecording()) restoreLevelAfterRecording();
+    });
     return;
   }
   if (!canRecord()) {
@@ -1197,7 +1232,11 @@ function renderGuide(): void {
         nowTitle.textContent = `${lastPlayed!.name} · архив`;
         nowTitle.title = url;
         playerBar.hidden = false;
-        player.play({ ...lastPlayed!, url });
+        const refusedCatchup = player.play({ ...lastPlayed!, url });
+        if (refusedCatchup) {
+          showToast(refusedCatchup);
+          return;
+        }
         guideOverlay.hidden = true;
       });
     } else {

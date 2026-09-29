@@ -1,5 +1,16 @@
 import { describe, it, expect } from "vitest";
-import { neighborIndex, skipTarget } from "../src/player";
+import { neighborIndex, shouldRetryNetwork, skipTarget } from "../src/player";
+
+describe("shouldRetryNetwork", () => {
+  it("даёт несколько попыток восстановиться", () => {
+    expect(shouldRetryNetwork(1)).toBe(true);
+    expect(shouldRetryNetwork(3)).toBe(true);
+  });
+  it("сдаётся после предела — иначе мёртвый поток переподключается вечно", () => {
+    expect(shouldRetryNetwork(4)).toBe(false);
+    expect(shouldRetryNetwork(99)).toBe(false);
+  });
+});
 
 describe("neighborIndex (prev/next channel)", () => {
   it("returns null for an empty list", () => {

@@ -104,7 +104,11 @@ iptv-hub/
 │   ├── config.ts           # ?p=&e= → localStorage → null (чистый, тестируемый)
 │   ├── m3u.ts              # парсер M3U: Channel, категории, normalizeName
 │   ├── epg.ts              # загрузка (стрим+gzip) и разбор XMLTV, now/next
-│   ├── player.ts           # Player: hls.js / нативный <video>
+│   ├── player.ts           # Player: hls.js / нативный <video>, хук на сегменты
+│   ├── recorder.ts         # запись перекодированием: mime, имя файла, жизненный цикл
+│   ├── segment-recorder.ts # запись HLS сегментами: контейнер, потолок, init-сегмент
+│   ├── recording-sink.ts   # куда писать: OPFS на диск, откат — память
+│   ├── debug-log.ts        # экранный лог по ?debug=1 (на телефоне консоли нет)
 │   ├── types.ts            # Channel, PlaylistSnapshot, EpgProgramme, NowNext
 │   └── style.css           # тёмная неоновая тема, mobile-first
 ├── tests/                  # vitest: m3u, epg, config, pwa (node env, без DOM)
@@ -123,6 +127,29 @@ localStorage ┴→ resolveConfig ─→ fetch playlist ─→ parseM3U ─→ U
                                                 ─→ getNowNext ─→ бейджи в списке
 Клик по каналу ─→ Player.play() ─→ hls.js | <video>.src
 ```
+
+### Запись эфира
+
+Два пути, выбор по наличию hls-инстанса:
+
+```
+HLS  ─→ FRAG_LOADED ─→ segment-recorder ─→ OPFS/память ─→ .ts | .mp4
+иное ─→ captureStream(<video>) | канвас+WebAudio ─→ MediaRecorder ─→ .webm
+```
+
+Сегментный путь ничего не перекодирует: складывает то, что hls.js уже скачал.
+Он и основной — перекодирование осталось для нативного воспроизведения и
+прямых mp4, где сегментов нет.
+
+Про перекодирование важно помнить (выяснено в #58/#60):
+
+- mime обязан соответствовать **фактическому** составу дорожек: если объявить
+  `opus` без аудиодорожки, Firefox зависает намертво, а `isTypeSupported`
+  рассинхрон не показывает;
+- после `stop()` источник трогать нельзя — Gecko досылает последний чанк и
+  событие `stop` примерно через 16 мс, снос в этом окне съедает и то, и другое;
+- на Firefox для Android перекодирование невозможно в принципе: захват
+  элемента роняет энкодер, канвас отдаёт черноту.
 
 ### Ключевые типы (`src/types.ts`)
 

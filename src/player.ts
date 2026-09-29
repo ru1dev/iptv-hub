@@ -1,5 +1,13 @@
 import Hls from "hls.js";
+import { isMixedContent } from "./config";
 import type { Channel } from "./types";
+
+/**
+ * Сколько подряд сетевых сбоев переживаем, прежде чем сдаться. Без предела
+ * заблокированный или мёртвый поток крутит переподключение вечно, показывая
+ * один и тот же тост и не давая пользователю понять, что канал не работает.
+ */
+const MAX_NETWORK_RETRIES = 3;
 
 /**
  * Плеер поверх <video>: hls.js для .m3u8, нативные механизмы для остальных.
@@ -22,6 +30,8 @@ export class Player {
    * нужно копию.
    */
   private onFragment: ((payload: ArrayBuffer, isInit: boolean) => void) | null = null;
+  /** Сетевые сбои подряд; сбрасывается, как только пошли данные. */
+  private networkRetries = 0;
 
   constructor(
     video: HTMLVideoElement,
@@ -46,15 +56,27 @@ export class Player {
   /** Повесить обработчик сегментов на текущий hls-инстанс. */
   private attachFragmentListener(): void {
     this.hls?.on(Hls.Events.FRAG_LOADED, (_e, data) => {
+      this.networkRetries = 0; // данные пошли — прошлые сбои не в счёт
       this.onFragment?.(data.payload, data.frag.sn === "initSegment");
     });
   }
 
-  /** Играть канал. True — попытка начата, false — URL не поддерживается. */
-  play(channel: Channel): boolean {
+  /**
+   * Играть канал. null — попытка начата, строка — причина отказа (её и
+   * показывает вызывающий; сам плеер про это не тостит, чтобы сообщения
+   * не наслаивались).
+   */
+  play(channel: Channel): string | null {
     const url = channel.url;
-    if (this.currentUrl === url && !this.video.paused) return true;
+    if (this.currentUrl === url && !this.video.paused) return null;
+    // Браузер блокирует http-поток на https-странице ещё до сети, и снаружи
+    // это выглядит как обычный сетевой сбой — плеер уходил в бесконечное
+    // переподключение вместо того, чтобы назвать причину.
+    if (isMixedContent(window.location.href, url)) {
+      return "Канал отдаётся по http — браузер блокирует его на https-странице";
+    }
     this.stop();
+    this.networkRetries = 0;
 
     const isHls = /\.m3u8(\?|$)/i.test(url) || /[?&]type=m3u8/i.test(url);
     const isDash = /\.mpd(\?|$)/i.test(url);
@@ -67,10 +89,16 @@ export class Player {
         if (!data.fatal) return;
         // Автовосстановление по типу ошибки (рекомендации hls.js):
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          if (!shouldRetryNetwork(++this.networkRetries)) {
+            console.debug(`[iptv-hub] hls network error: ${data.details}, сдаёмся`);
+            this.toast("Поток не отвечает — попробуйте повтор или другой канал");
+            this.onFatalError?.();
+            return;
+          }
           // сеть/манифест: пробуем перезапустить загрузку
           console.debug(`[iptv-hub] hls network error: ${data.details}, restarting load`);
           this.hls?.startLoad();
-          this.toast("Сбой сети — переподключаемся…");
+          this.toast(`Сбой сети — переподключаемся (${this.networkRetries}/${MAX_NETWORK_RETRIES})…`);
           return;
         }
         if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
@@ -91,8 +119,7 @@ export class Player {
       this.hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, notify);
       this.attachFragmentListener();
     } else if (isDash) {
-      this.toast("MPEG-DASH не поддерживается в MVP (см. ROADMAP)");
-      return false;
+      return "MPEG-DASH не поддерживается в MVP (см. ROADMAP)";
     } else {
       // http progressive (mp4) или нативный HLS в Safari/iOS
       this.video.src = url;
@@ -102,7 +129,7 @@ export class Player {
     this.video.play().catch(() => {
       // автоплей с звуком может быть заблокирован — юзер нажмёт play вручную
     });
-    return true;
+    return null;
   }
 
   /** Пауза/продолжить. Возвращает true после вызова — на паузе или играет. */
@@ -188,6 +215,7 @@ export class Player {
     const isHls = /\.m3u8(\?|$)/i.test(url) || /[?&]type=m3u8/i.test(url);
     const channel: Channel = { url, name: "", normalizedName: "", tvgId: null, logo: null, group: "", quality: null, catchupDays: 0, catchupSource: null };
     this.stop();
+    this.networkRetries = 0; // ручной повтор даёт потоку новый лимит попыток
     if (isHls && Hls.isSupported()) {
       this.hls = new Hls({ enableWorker: true, lowLatencyMode: false });
       this.hls.loadSource(url);
@@ -210,6 +238,14 @@ export class Player {
     this.video.play().catch(() => undefined);
     void channel;
   }
+}
+
+/**
+ * Стоит ли ещё раз перезапускать загрузку после сетевого сбоя.
+ * Вынесено из класса, чтобы предел попыток покрывался тестом без DOM и hls.js.
+ */
+export function shouldRetryNetwork(consecutiveFailures: number): boolean {
+  return consecutiveFailures <= MAX_NETWORK_RETRIES;
 }
 
 /**
